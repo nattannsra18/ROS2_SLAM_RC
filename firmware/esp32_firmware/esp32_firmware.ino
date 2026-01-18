@@ -1,214 +1,297 @@
-/**
- * File: esp32_firmware_v2.ino
- * Description: RC Control + Improved Hall Sensor (Interval Method + Zero Timeout)
- */
-
+#include <Wire.h>
 #include <ESP32Servo.h>
 
-/* ================== PIN DEFINITIONS ================== */
-const int PIN_THROTTLE = 13;
-const int PIN_STEERING = 12;
-const int PIN_HALL     = 25;
+// ==========================================
+// 1. HARDWARE CONFIGURATION
+// ==========================================
+#define SERIAL_BAUD      921600   // High speed serial for low latency
+#define PIN_THROTTLE     13       // ESC Signal Pin
+#define PIN_STEERING     12       // Servo Signal Pin
+#define PIN_HALL         25       // Hall Effect Sensor (Speed)
 
-/* ================== CONFIG ================== */
-const int COAST_MIN = 1490;
-const int COAST_MAX = 1510;
-const unsigned long FAILSAFE_TIMEOUT = 500; // ms
+// ==========================================
+// 2. DRIVING DYNAMICS TUNING
+// ==========================================
+// Throttle Smoothing
+#define RAMP_INTERVAL_MS 2        // Update throttle every X ms
+#define THROTTLE_STEP    50       // Max change per step (Higher = More aggressive)
 
-// ตั้งค่าความถี่ในการส่งข้อมูลกลับ Odroid (ms)
-// 50ms = 20Hz (กำลังดี ไม่รก Serial)
-const unsigned long SEND_INTERVAL = 50; 
+// Deadzone & Neutral
+#define DEADZONE_MIN     1480
+#define DEADZONE_MAX     1520
+#define USE_SIGNAL_CUT   true     // true = Enable Coasting (Detach Servo)
 
-/* ================== WHEEL CONFIG ================== */
-const int   pulsesPerRev = 2;        // แม่เหล็ก 2 ตัว
-const float wheelDiameter = 0.0715;  // meter
-const float wheelCircumference = 3.1415926 * wheelDiameter;
+// ==========================================
+// 3. SPEEDOMETER CALIBRATION
+// ==========================================
+// Physics
+#define TIRE_DIAMETER_M  0.070    // Wheel Diameter: 7 cm
+#define PULSES_PER_REV   2.0      // Magnets per wheel revolution
 
-/* ================== FILTER CONFIG ================== */
-#define FILTER_SIZE 5
-float speedBuffer[FILTER_SIZE];
-int   filterIndex = 0;
+// Signal Filtering (Crucial for clean speed)
+#define DEBOUNCE_MS      15       // Ignore pulses closer than 15ms (Noise filter)
+#define WINDOW_SIZE      5        // Number of samples for Moving Average
+#define UPDATE_RATE_MS   50       // Speed calc frequency (20Hz)
 
-/* ================== OBJECTS ================== */
+// ==========================================
+// GLOBAL VARIABLES
+// ==========================================
 Servo servoThrottle;
 Servo servoSteering;
 
-/* ================== RC STATE ================== */
-unsigned long lastPacketTime = 0;
-String inputString = "";
-bool stringComplete = false;
-int lastDirection = 1;
+// --- Speed Calculation ---
+volatile unsigned long pulseCountISR = 0;    // Pulses from Interrupt
+volatile unsigned long lastDebounceTime = 0; // Timestamp for Debounce
+unsigned long pulseHistory[WINDOW_SIZE];     // Rolling window buffer
+byte historyIdx = 0;
+float currentSpeedMs = 0.0;
 
-/* ================== SENSOR STATE ================== */
-volatile unsigned long lastPulseTime = 0;
-volatile unsigned long pulseInterval = 0;
-volatile bool newPulse = false;
+// --- IMU (Gyro) ---
+#define MPU_ADDR 0x68
+float gyroZ_offset = 0;
 
-float currentSpeedMps = 0.0;
-unsigned long lastSendTime = 0;
+// --- Control State ---
+int targetThrottle  = 1500;
+int currentThrottle = 1500;  // Actual PWM sent to motor
+int targetSteering  = 1500;
+unsigned long lastCmdTime = 0;
+unsigned long lastRampTime = 0;
 
-/* ================== ISR (INTERRUPT) ================== */
+// --- Drive Logic Flags ---
+bool isCoasting      = false;
+bool isForwardAction = true; // Track intended direction
+
+// --- Serial Buffer ---
+const byte numChars = 64;
+char receivedChars[numChars];
+
+// ==========================================
+// INTERRUPT SERVICE ROUTINE (ISR)
+// ==========================================
 void IRAM_ATTR hallISR() {
-    unsigned long now = micros();
-    // คำนวณเวลาที่ผ่านไปจาก Pulse รอบที่แล้ว
-    pulseInterval = now - lastPulseTime;
-    lastPulseTime = now;
-    newPulse = true;
+  unsigned long now = millis();
+  
+  // Debounce Logic:
+  // ถ้าระยะเวลาห่างจาก pulse ล่าสุด น้อยกว่า DEBOUNCE_MS -> ถือว่าเป็น Noise
+  if (now - lastDebounceTime > DEBOUNCE_MS) {
+    pulseCountISR++;
+    lastDebounceTime = now;
+  }
 }
 
-/* ================== SETUP ================== */
+// ==========================================
+// SETUP
+// ==========================================
 void setup() {
-    Serial.begin(921600); // High Baudrate
+  // 1. Init Serial
+  Serial.begin(SERIAL_BAUD);
+  Serial.setTimeout(1);
 
-    /* ---- Servo ---- */
-    servoThrottle.setPeriodHertz(50);
-    servoSteering.setPeriodHertz(50);
-    servoThrottle.attach(PIN_THROTTLE, 1000, 2000);
-    servoSteering.attach(PIN_STEERING, 1000, 2000);
-    servoThrottle.writeMicroseconds(1500);
-    servoSteering.writeMicroseconds(1500);
-    
-    delay(2000); // ESC Arming delay
+  // 2. Init Servos
+  servoThrottle.setPeriodHertz(50);
+  servoSteering.setPeriodHertz(50);
+  servoThrottle.attach(PIN_THROTTLE, 1000, 2000);
+  servoSteering.attach(PIN_STEERING, 1000, 2000);
 
-    /* ---- Hall Sensor ---- */
-    pinMode(PIN_HALL, INPUT_PULLUP);
-    // ใช้ RISING ตามโค้ดใหม่ที่คุณให้มา
-    attachInterrupt(digitalPinToInterrupt(PIN_HALL), hallISR, RISING);
+  // 3. ESC Arming Sequence (Safety)
+  // ส่งค่า Neutral แช่ไว้ 3 วินาที เพื่อให้ ESC พร้อมทำงาน
+  servoThrottle.writeMicroseconds(1500);
+  servoSteering.writeMicroseconds(1500);
+  delay(3000);
 
-    // Init Filter Buffer
-    for (int i = 0; i < FILTER_SIZE; i++) {
-        speedBuffer[i] = 0.0;
+  // 4. Init Hall Sensor
+  pinMode(PIN_HALL, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_HALL), hallISR, FALLING);
+
+  // 5. Init IMU (MPU6050)
+  Wire.begin();
+  Wire.setClock(400000); // Fast Mode
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B); // Power Management 1
+  Wire.write(0);    // Wake up
+  Wire.endTransmission(true);
+
+  // 6. Calibrate Gyro (Zeroing)
+  delay(500);
+  long sum = 0;
+  for(int i=0; i<100; i++) {
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(0x47); // Register 0x47 (GYRO_ZOUT_H)
+    Wire.endTransmission(false);
+    Wire.requestFrom(MPU_ADDR, 2);
+    if(Wire.available() >= 2) {
+      int16_t reading = (Wire.read() << 8) | Wire.read();
+      sum += reading;
     }
+    delay(2);
+  }
+  gyroZ_offset = sum / 100.0;
 
-    inputString.reserve(200);
-    lastPacketTime = millis();
-    lastPulseTime = micros(); 
-
-    Serial.println("ESP32 Firmware V2 Ready");
+  // 7. Reset History
+  for(int i=0; i<WINDOW_SIZE; i++) pulseHistory[i] = 0;
+  lastCmdTime = millis();
 }
 
-/* ================== CONTROL LOGIC (เดิม) ================== */
-void handleThrottle(int pwm) {
-    if (pwm < COAST_MIN || pwm > COAST_MAX) {
-        if (pwm > 1500) lastDirection = 1;
-        else            lastDirection = -1;
+// ==========================================
+// HELPER: PARSE COMMAND
+// ==========================================
+void parseInternal() {
+  // Expected format: <throttle,steering>
+  char * strtokIndx; 
+  
+  strtokIndx = strtok(receivedChars, ",");
+  if(strtokIndx == NULL) return;
+  int thr = atoi(strtokIndx);
+  
+  strtokIndx = strtok(NULL, ",");
+  if(strtokIndx == NULL) return;
+  int str = atoi(strtokIndx);
 
-        if (!servoThrottle.attached()) servoThrottle.attach(PIN_THROTTLE, 1000, 2000);
-        servoThrottle.writeMicroseconds(pwm);
-    } else {
-        if (lastDirection == 1) {
-            if (servoThrottle.attached()) {
-                servoThrottle.detach();
-                pinMode(PIN_THROTTLE, OUTPUT);
-                digitalWrite(PIN_THROTTLE, LOW);
-            }
-        } else {
-            if (!servoThrottle.attached()) servoThrottle.attach(PIN_THROTTLE, 1000, 2000);
-            servoThrottle.writeMicroseconds(1500);
-        }
-    }
+  targetThrottle = constrain(thr, 1000, 2000);
+  targetSteering = constrain(str, 1000, 2000);
+  lastCmdTime = millis();
 }
 
-void emergencyStop() {
-    if (!servoThrottle.attached()) servoThrottle.attach(PIN_THROTTLE, 1000, 2000);
-    servoThrottle.writeMicroseconds(1500);
-    servoSteering.writeMicroseconds(1500);
-}
-
-void processPacket(String data) {
-    if (!data.startsWith("<") || !data.endsWith(">")) return;
-    data = data.substring(1, data.length() - 1);
-    int commaIndex = data.indexOf(',');
-    if (commaIndex == -1) return;
-
-    int pwmThrottle = data.substring(0, commaIndex).toInt();
-    int pwmSteer    = data.substring(commaIndex + 1).toInt();
-
-    lastPacketTime = millis();
-    handleThrottle(constrain(pwmThrottle, 1000, 2000));
-    servoSteering.writeMicroseconds(constrain(pwmSteer, 1000, 2000));
-}
-
-/* ================== SPEED CALCULATION ================== */
-void updateSpeedSensor() {
-    
-    // 1. กรณีมี Pulse เข้ามาใหม่ (ล้อหมุน)
-    if (newPulse) {
-        noInterrupts();
-        unsigned long interval = pulseInterval;
-        newPulse = false;
-        interrupts();
-
-        if (interval > 0) {
-            // คำนวณ RPM
-            float rpm = (60.0 * 1000000.0) / (interval * pulsesPerRev);
-            
-            // คำนวณ m/s
-            float rawSpeed = (wheelCircumference * rpm) / 60.0;
-
-            // --- Moving Average Filter ---
-            speedBuffer[filterIndex] = rawSpeed;
-            filterIndex = (filterIndex + 1) % FILTER_SIZE;
-
-            float sum = 0.0;
-            for (int i = 0; i < FILTER_SIZE; i++) {
-                sum += speedBuffer[i];
-            }
-            currentSpeedMps = sum / FILTER_SIZE;
-        }
-    }
-
-    // 2. กรณี Timeout (ล้อหยุดหมุน)
-    // ถ้าเวลาผ่านไปเกิน 0.5 วินาที (500,000 micros) โดยไม่มี pulse ใหม่
-    if (micros() - lastPulseTime > 300000) { 
-        currentSpeedMps = 0.0;
-        
-        // Reset Buffer เพื่อให้ตอนออกตัวใหม่ค่าค่อยๆ ไต่ขึ้น ไม่กระโดด
-        // (หรือถ้าอยากให้ออกตัวไว ไม่ต้อง reset ก็ได้ แต่ reset จะนุ่มนวลกว่า)
-        /*
-        for (int i = 0; i < FILTER_SIZE; i++) {
-            speedBuffer[i] = 0.0;
-        }
-        */
-    }
-}
-
-/* ================== SEND TELEMETRY ================== */
-void sendTelemetry() {
-    unsigned long now = millis();
-    if (now - lastSendTime >= SEND_INTERVAL) {
-        // ส่ง Format <SPD:xx.xx> ตามเดิม
-        Serial.print("<SPD:");
-        Serial.print(currentSpeedMps, 3); // ทศนิยม 3 ตำแหน่งเพื่อความละเอียด
-        Serial.println(">");
-        
-        lastSendTime = now;
-    }
-}
-
-/* ================== MAIN LOOP ================== */
+// ==========================================
+// MAIN LOOP
+// ==========================================
 void loop() {
-    // 1. รับคำสั่ง Serial
-    while (Serial.available()) {
-        char inChar = (char)Serial.read();
-        inputString += inChar;
-        if (inChar == '>') stringComplete = true;
+  // -----------------------------
+  // 1. SERIAL READ (Non-blocking)
+  // -----------------------------
+  static boolean recvInProgress = false;
+  static byte ndx = 0;
+  char startMarker = '<';
+  char endMarker = '>';
+  char rc;
+
+  while (Serial.available() > 0) {
+    rc = Serial.read();
+
+    if (recvInProgress == true) {
+      if (rc != endMarker) {
+        receivedChars[ndx] = rc;
+        ndx++;
+        if (ndx >= numChars) ndx = numChars - 1;
+      } else {
+        receivedChars[ndx] = '\0'; // Terminate string
+        recvInProgress = false;
+        ndx = 0;
+        parseInternal();
+      }
+    } else if (rc == startMarker) {
+      recvInProgress = true;
     }
-    if (stringComplete) {
-        inputString.trim();
-        processPacket(inputString);
-        inputString = "";
-        stringComplete = false;
+  }
+
+  // -----------------------------
+  // 2. MOTOR CONTROL LOGIC
+  // -----------------------------
+  servoSteering.writeMicroseconds(targetSteering);
+
+  // --- CASE A: NEUTRAL / DEADZONE ---
+  if (targetThrottle > DEADZONE_MIN && targetThrottle < DEADZONE_MAX) {
+      if (USE_SIGNAL_CUT && isForwardAction) {
+          // Coasting Mode: ตัดสัญญาณเพื่อให้รถไหลฟรี (เลียนแบบคลัตช์)
+          if (!isCoasting) {
+             servoThrottle.detach();
+             isCoasting = true;
+             currentThrottle = 1500;
+          }
+      } else {
+          // Normal Mode: สั่งเบรก/หยุดมอเตอร์
+          if (isCoasting) {
+             servoThrottle.attach(PIN_THROTTLE, 1000, 2000);
+             isCoasting = false;
+          }
+          servoThrottle.writeMicroseconds(1500);
+          currentThrottle = 1500;
+      }
+  } 
+  // --- CASE B: ACTIVE DRIVING ---
+  else {
+      // ตรวจสอบทิศทางที่ตั้งใจขับ (เพื่อใช้ตัดสินใจตอนปล่อยคันเร่ง)
+      if (targetThrottle > 1520) isForwardAction = true;
+      else if (targetThrottle < 1480) isForwardAction = false;
+
+      // Re-attach servo if returning from coasting
+      if (isCoasting) {
+          servoThrottle.attach(PIN_THROTTLE, 1000, 2000);
+          isCoasting = false;
+      }
+
+      // Smooth Ramping (ป้องกันกระชาก)
+      if (millis() - lastRampTime >= RAMP_INTERVAL_MS) {
+        if (currentThrottle != targetThrottle) {
+            if (currentThrottle < targetThrottle) {
+              currentThrottle += THROTTLE_STEP;
+              if (currentThrottle > targetThrottle) currentThrottle = targetThrottle;
+            } else {
+              currentThrottle -= THROTTLE_STEP;
+              if (currentThrottle < targetThrottle) currentThrottle = targetThrottle;
+            }
+            servoThrottle.writeMicroseconds(currentThrottle);
+        }
+        lastRampTime = millis();
+      }
+  }
+
+  // --- FAILSAFE (Safety Stop) ---
+  // ถ้าขาดการติดต่อนานเกิน 0.5 วินาที ให้หยุดรถ
+  if (millis() - lastCmdTime > 500) {
+    targetThrottle = 1500;
+    targetSteering = 1500;
+    if (!isCoasting) servoThrottle.writeMicroseconds(1500);
+  }
+
+  // -----------------------------
+  // 3. TELEMETRY & SPEED CALC
+  // -----------------------------
+  static unsigned long lastCalc = 0;
+  
+  if (millis() - lastCalc >= UPDATE_RATE_MS) {
+    
+    // A. ดึงค่าจาก ISR อย่างปลอดภัย (Critical Section)
+    noInterrupts();
+    unsigned long pulsesNow = pulseCountISR;
+    pulseCountISR = 0;
+    interrupts();
+
+    // B. เก็บลง Rolling Window Buffer
+    pulseHistory[historyIdx] = pulsesNow;
+    historyIdx = (historyIdx + 1) % WINDOW_SIZE;
+
+    // C. รวมผล Pulse ย้อนหลัง (Smoothing)
+    unsigned long totalPulses = 0;
+    for(int i=0; i<WINDOW_SIZE; i++) {
+        totalPulses += pulseHistory[i];
     }
 
-    // 2. อัปเดตเซนเซอร์
-    updateSpeedSensor();
-
-    // 3. ส่งข้อมูลกลับ (ทุกๆ 50ms)
-    sendTelemetry();
-
-    // 4. Failsafe
-    if (millis() - lastPacketTime > FAILSAFE_TIMEOUT) {
-        emergencyStop();
+    // D. คำนวณความเร็ว (m/s)
+    // Formula: (TotalPulses / TimeWindow) / PPR * Circumference
+    float totalTimeSec = (UPDATE_RATE_MS * WINDOW_SIZE) / 1000.0; // Window time (0.25s)
+    
+    if (totalTimeSec > 0 && totalPulses > 0) {
+        float rps = ((float)totalPulses / totalTimeSec) / PULSES_PER_REV;
+        currentSpeedMs = rps * 3.14159 * TIRE_DIAMETER_M;
+    } else {
+        currentSpeedMs = 0.0;
     }
+
+    // E. อ่านค่า Gyro (Z-Axis)
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(0x47);
+    Wire.endTransmission(false);
+    Wire.requestFrom(MPU_ADDR, 2);
+    int16_t rawZ = (Wire.read() << 8) | Wire.read();
+    float gyroZ = ((float)rawZ - gyroZ_offset) / 131.0;
+
+    // F. ส่งข้อมูลกลับ PC <SPD:speed,gyro,thr,str>
+    // Format: <SPD:1.25,0.05,1550,1400>
+    char msg[64];
+    sprintf(msg, "<SPD:%.2f,%.2f,%d,%d>", currentSpeedMs, gyroZ, currentThrottle, targetSteering);
+    Serial.println(msg);
+    
+    lastCalc = millis();
+  }
 }

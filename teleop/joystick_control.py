@@ -1,192 +1,181 @@
-"""
-File: pc_controller_v3.py
-Description: RC Controller with Tuned Gears & Debug Mode
-Features:
-  - Gear System (1-5)
-  - Tuned Reverse Limit (Max 1300)
-  - Debug RX for Speed Telemetry
-"""
-
 import socket
 import pygame
 import time
 import threading
 
-# --- Network Configuration ---
-TARGET_IP = "odroid" 
-TX_PORT = 4210
-RX_PORT = 4211
+# ==========================================
+# CONFIGURATION SETTINGS
+# ==========================================
 
-# --- Hardware Mapping (Xbox Controller) ---
-AXIS_RT = 5  # Gas
-AXIS_LT = 4  # Brake/Reverse
-BUTTON_X = 2 # Gear Down
-BUTTON_Y = 3 # Gear Up
+# Network Configuration
+TARGET_IP = "odroid"    # IP หรือ Hostname ของ Odroid ปลายทาง
+TX_PORT   = 4210        # Port สำหรับส่งข้อมูลไปหา Odroid
+RX_PORT   = 4211        # Port สำหรับรอรับข้อมูลจาก Odroid
 
-# --- Gearbox Configuration ---
-GEAR_MAX = 5
-PWM_NEUTRAL = 1500
+# Joystick Mapping (Linux/KDE Standard)
+AXIS_STEER  = 0         # แกนหมุนเลี้ยว (Left Stick X-Axis)
+AXIS_ACCEL  = 5         # คันเร่ง (RT - Right Trigger)
+AXIS_BRAKE  = 2         # เบรก/ถอยหลัง (LT - Left Trigger)
+BTN_GEAR_UP = 3         # ปุ่มเพิ่มเกียร์ (Y Button)
+BTN_GEAR_DN = 0         # ปุ่มลดเกียร์ (A Button)
 
-# จุดเริ่มทำงาน (Start PWM)
-PWM_FWD_START = 1580 
-PWM_REV_START = 1430 
+# Control Logic Config
+GYRO_DEADZONE = 5.0     # ค่า Deadzone ของ Gyro เพื่อตัด Noise
 
-# --- ปรับจูนความเร็วสูงสุดที่นี่ ---
-PWM_FWD_LIMIT = 2000
-PWM_REV_LIMIT = 1300  
+# Global Variables (Telemetry)
+current_speed = 0.0
+current_gyro  = 0.0
+turn_status   = "--- STRAIGHT ---"
 
-# --- Smoothing & Kick-back ---
-RAMP_STEP = 150      
-STEER_TRIM = 0        
-STEER_DEADZONE = 20   
-KICK_ENABLE = True    
-KICK_FORCE = 60       
-KICK_DURATION = 8     
-
-# --- State Variables ---
-current_gear = 1      
-current_pwm_throttle = 1500 
-current_speed_display = 0.0
-last_steer_side = 0   
-kick_counter = 0      
-prev_btn_x = 0
-prev_btn_y = 0
-
-# --- Setup Network ---
+# ==========================================
+# NETWORK SETUP
+# ==========================================
 sock_tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock_rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock_rx.bind(("0.0.0.0", RX_PORT)) # รอรับทุก IP
-sock_rx.settimeout(0.01)
+sock_rx.bind(("0.0.0.0", RX_PORT)) 
+sock_rx.settimeout(0.005)  # Timeout สั้นมากเพื่อป้องกัน RX บล็อกการทำงานหลัก
 
-# --- Setup Pygame ---
+# ==========================================
+# PYGAME & JOYSTICK SETUP
+# ==========================================
 pygame.init()
 pygame.joystick.init()
+
 if pygame.joystick.get_count() == 0:
-    print("❌ No joystick detected!")
+    print("Error: No Joystick Found")
     exit()
+
 joy = pygame.joystick.Joystick(0)
 joy.init()
-print(f"🎮 Connected: {joy.get_name()}")
+print(f" Connected: {joy.get_name()}")
 
-# ================= RX THREAD (DEBUG MODE) =================
-def udp_receive_thread():
-    global current_speed_display
+# ==========================================
+# THREAD: RECEIVE DATA (RX)
+# ==========================================
+def rx_thread():
+    """
+    Thread สำหรับรอรับข้อมูล Telemetry จาก Odroid
+    Format ที่คาดหวัง: <SPD:speed,gyro>
+    """
+    global current_speed, current_gyro, turn_status
     while True:
         try:
-            data, addr = sock_rx.recvfrom(128)
+            data, _ = sock_rx.recvfrom(128)
             msg = data.decode('utf-8', errors='ignore').strip()
             
+            # ตรวจสอบ Header และ Footer ของข้อมูล
             if msg.startswith("<SPD:") and msg.endswith(">"):
-                try:
-                    speed_str = msg[5:-1]
-                    current_speed_display = float(speed_str)
-                except ValueError:
-                    pass
+                # ตัดส่วน <SPD: และ > ออก แล้วแยกค่าด้วย comma
+                val_str = msg[5:-1]
+                parts = val_str.split(',')
+                
+                if len(parts) >= 2:
+                    current_speed = float(parts[0])
+                    current_gyro  = float(parts[1])
+                    
+                    # Update สถานะการเลี้ยวตามค่า Gyro
+                    if current_gyro > GYRO_DEADZONE:
+                        turn_status = "TURNING LEFT  <<<<"
+                    elif current_gyro < -GYRO_DEADZONE:
+                        turn_status = "TURNING RIGHT >>>>"
+                    else:
+                        turn_status = "--- STRAIGHT ---"
+
         except socket.timeout:
-            continue
-        except Exception as e:
-            print(f"RX Error: {e}")
+            continue  # ไม่มีข้อมูลมา ให้วนลูปต่อเงียบๆ
+        except Exception:
+            pass      # ข้าม Error อื่นๆ เพื่อกันโปรแกรมหลุด
 
 # Start RX Thread
-threading.Thread(target=udp_receive_thread, daemon=True).start()
+threading.Thread(target=rx_thread, daemon=True).start()
 
-# ================= HELPER FUNCTIONS =================
-def smooth_approach(current, target, step):
-    if abs(current - target) < step: return target
-    if current < target: return current + step
-    else: return current - step
-
-def map_gear_speed(trigger_val, is_forward):
-    """คำนวณ PWM ตามเกียร์"""
-    gear_ratio = current_gear / GEAR_MAX 
+# ==========================================
+# HELPER FUNCTIONS
+# ==========================================
+def get_linux_trigger(axis_idx):
+    """
+    แปลงค่า Trigger ของ Linux Joystick
+    Input: -1.0 (ปล่อย) ถึง 1.0 (กดสุด)
+    Output: 0.0 (ปล่อย) ถึง 1.0 (กดสุด)
+    """
+    raw = joy.get_axis(axis_idx)
+    val = (raw + 1.0) / 2.0
     
-    if is_forward:
-        available_range = PWM_FWD_LIMIT - PWM_FWD_START
-        current_range_limit = available_range * gear_ratio
-        return PWM_FWD_START + (trigger_val * current_range_limit)
-    else:
-        # Logic ถอยหลัง: 1430 ลงไปหา 1300
-        # Range เต็ม = 1430 - 1300 = 130
-        available_range = PWM_REV_START - PWM_REV_LIMIT 
-        current_range_limit = available_range * gear_ratio
-        
-        # ยิ่งกดเยอะ ค่า PWM ยิ่งลดลง (เข้าใกล้ 1300)
-        return PWM_REV_START - (trigger_val * current_range_limit)
+    # Deadzone เล็กน้อยเพื่อกันค่าแกว่งตอนปล่อยปุ่ม
+    if val < 0.05: return 0.0
+    return val
 
-def get_trigger(axis):
-    val = joy.get_axis(axis)
-    if abs(val) < 0.01: return 0.0
-    val = (val + 1) / 2
-    return 0.0 if val < 0.05 else val
-
-# ================= MAIN LOOP =================
+# ==========================================
+# MAIN LOOP
+# ==========================================
 try:
-    last_print_time = 0
-    print("🚀 Controller Ready. Press Ctrl+C to stop.")
+    # Local State Variables
+    current_gear = 1
+    max_gear     = 5
+    prev_gear_up = 0
+    prev_gear_dn = 0
+    
+    print(f" Ready! Linking to Odroid @ {TARGET_IP}")
 
     while True:
-        pygame.event.pump()
+        pygame.event.pump() # อัปเดต Event ของ Pygame
         
-        # --- Gear Shift ---
-        btn_x = joy.get_button(BUTTON_X)
-        btn_y = joy.get_button(BUTTON_Y)
-        if btn_x and not prev_btn_x and current_gear > 1: current_gear -= 1
-        if btn_y and not prev_btn_y and current_gear < GEAR_MAX: current_gear += 1
-        prev_btn_x, prev_btn_y = btn_x, btn_y
-
-        # --- Throttle & Brake ---
-        gas = get_trigger(AXIS_RT)   
-        brake = get_trigger(AXIS_LT) 
+        # -----------------------------
+        # 1. Gear Logic (Rising Edge)
+        # -----------------------------
+        g_up = joy.get_button(BTN_GEAR_UP)
+        g_dn = joy.get_button(BTN_GEAR_DN)
         
-        target = 1500
-        if gas > 0.01: target = map_gear_speed(gas, True)
-        elif brake > 0.01: target = map_gear_speed(brake, False)
-
-        current_pwm_throttle = smooth_approach(current_pwm_throttle, target, RAMP_STEP)
-        pwm_throttle = int(current_pwm_throttle)
-
-        # --- Steering ---
-        steer = joy.get_axis(0)
-        raw_steer = (steer * -500) + 1500 + STEER_TRIM
-        
-        if raw_steer < 1450: last_steer_side = 1
-        elif raw_steer > 1550: last_steer_side = -1
-
-        if abs(raw_steer - 1500) < STEER_DEADZONE:
-            if KICK_ENABLE and last_steer_side == 1:
-                kick_counter = KICK_DURATION
-                last_steer_side = 0 
+        # เพิ่มเกียร์เมื่อกดครั้งแรก (และไม่เกิน max)
+        if g_up and not prev_gear_up and current_gear < max_gear: 
+            current_gear += 1
+        # ลดเกียร์เมื่อกดครั้งแรก (และไม่ต่ำกว่า 1)
+        if g_dn and not prev_gear_dn and current_gear > 1: 
+            current_gear -= 1
             
-            if kick_counter > 0:
-                pwm_steering = 1500 + KICK_FORCE
-                kick_counter -= 1
-            else:
-                pwm_steering = 1500
-        else:
-            kick_counter = 0
-            pwm_steering = int(raw_steer)
+        prev_gear_up, prev_gear_dn = g_up, g_dn
 
-        # --- Send UDP ---
-        msg = f"<{pwm_throttle},{pwm_steering}>"
-        sock_tx.sendto(msg.encode(), (TARGET_IP, TX_PORT))
+        # -----------------------------
+        # 2. Throttle Logic
+        # -----------------------------
+        rt = get_linux_trigger(AXIS_ACCEL)
+        lt = get_linux_trigger(AXIS_BRAKE)
         
-        # --- Display ---
-        now = time.time()
-        if now - last_print_time > 0.1:
-            # คำนวณความเร็ว Max ของเกียร์ปัจจุบันเพื่อโชว์
-            max_rev_gear = PWM_REV_START - ((PWM_REV_START - PWM_REV_LIMIT) * (current_gear/GEAR_MAX))
+        throttle_pwm = 1500 # ค่ากลาง (Neutral)
+        speed_factor = (current_gear / max_gear) # อัตราทดตามเกียร์
+        
+        if rt > 0.0:
+            # เดินหน้า: 1500 + (แรงกด * 500 * อัตราทด)
+            throttle_pwm = 1500 + int(rt * 500 * speed_factor)
+        elif lt > 0.0:
+            # ถอยหลัง/เบรก: 1500 - (แรงกด * 500 * อัตราทด)
+            throttle_pwm = 1500 - int(lt * 500 * speed_factor)
             
-            print(f"GEAR: {current_gear} | "
-                  f"PWM: {pwm_throttle:4d} (RevLim: {int(max_rev_gear)}) | "
-                  f"SPD: {current_speed_display:5.2f} m/s", end='\r')
-            last_print_time = now
+        # -----------------------------
+        # 3. Steering Logic
+        # -----------------------------
+        steer_axis = joy.get_axis(AXIS_STEER)
+        # แปลง Axis (-1..1) เป็น PWM offset (1500 +/- 500)
+        steer_pwm = 1500 - int(steer_axis * 500) 
 
-        time.sleep(0.001)
+        # -----------------------------
+        # 4. Network Send (UDP)
+        # -----------------------------
+        cmd = f"<{throttle_pwm},{steer_pwm}>"
+        sock_tx.sendto(cmd.encode(), (TARGET_IP, TX_PORT))
+
+        # -----------------------------
+        # 5. Dashboard Display
+        # -----------------------------
+        print(f"G:{current_gear} | PWM:{throttle_pwm} | SPD:{current_speed:5.2f} m/s | {turn_status}      ", end='\r')
+        
+        # 100Hz Update Rate (Control Loop Frequency)
+        time.sleep(0.01) 
 
 except KeyboardInterrupt:
-    print("\nStopping...")
-    for _ in range(5):
-        sock_tx.sendto(b"<1500,1500>", (TARGET_IP, TX_PORT))
-        time.sleep(0.05)
+    print("\n Stopping...")
+    # ส่งค่า Neutral ก่อนปิดโปรแกรมเพื่อความปลอดภัย
+    sock_tx.sendto(b"<1500,1500>", (TARGET_IP, TX_PORT))
     sock_tx.close()
     sock_rx.close()
+    print("Disconnected.")
